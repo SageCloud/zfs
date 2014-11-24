@@ -20,7 +20,7 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2013 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2014 by Delphix. All rights reserved.
  */
 
 /*
@@ -84,7 +84,7 @@ fzap_upgrade(zap_t *zap, dmu_tx_t *tx, zap_flags_t flags)
 	    &zap->zap_f.zap_phys, zap_evict);
 
 	mutex_init(&zap->zap_f.zap_num_entries_mtx, 0, 0, 0);
-	zap->zap_f.zap_block_shift = highbit(zap->zap_dbuf->db_size) - 1;
+	zap->zap_f.zap_block_shift = highbit64(zap->zap_dbuf->db_size) - 1;
 
 	zp = zap->zap_f.zap_phys;
 	/*
@@ -209,7 +209,7 @@ zap_table_grow(zap_t *zap, zap_table_phys_t *tbl,
 		tbl->zt_nextblk = 0;
 		tbl->zt_blks_copied = 0;
 
-		dprintf("finished; numblocks now %llu (%lluk entries)\n",
+		dprintf("finished; numblocks now %llu (%uk entries)\n",
 		    tbl->zt_numblks, 1<<(tbl->zt_shift-10));
 	}
 
@@ -458,7 +458,7 @@ zap_open_leaf(uint64_t blkid, dmu_buf_t *db)
 	rw_init(&l->l_rwlock, NULL, RW_DEFAULT, NULL);
 	rw_enter(&l->l_rwlock, RW_WRITER);
 	l->l_blkid = blkid;
-	l->l_bs = highbit(db->db_size)-1;
+	l->l_bs = highbit64(db->db_size) - 1;
 	l->l_dbuf = db;
 	l->l_phys = NULL;
 

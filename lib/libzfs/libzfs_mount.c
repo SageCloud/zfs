@@ -231,7 +231,8 @@ zfs_is_mountable(zfs_handle_t *zhp, char *buf, size_t buflen,
 	char sourceloc[ZFS_MAXNAMELEN];
 	zprop_source_t sourcetype;
 
-	if (!zfs_prop_valid_for_type(ZFS_PROP_MOUNTPOINT, zhp->zfs_type))
+	if (!zfs_prop_valid_for_type(ZFS_PROP_MOUNTPOINT, zhp->zfs_type,
+	    B_FALSE))
 		return (B_FALSE);
 
 	verify(zfs_prop_get(zhp, ZFS_PROP_MOUNTPOINT, buf, buflen,
@@ -405,6 +406,9 @@ zfs_mount(zfs_handle_t *zhp, const char *options, int flags)
 	if (zpool_get_prop_int(zhp->zpool_hdl, ZPOOL_PROP_READONLY, NULL))
 		(void) strlcat(mntopts, "," MNTOPT_RO, sizeof (mntopts));
 
+	if (!zfs_is_mountable(zhp, mountpoint, sizeof (mountpoint), NULL))
+		return (0);
+
 	/*
 	 * Append default mount options which apply to the mount point.
 	 * This is done because under Linux (unlike Solaris) multiple mount
@@ -425,9 +429,6 @@ zfs_mount(zfs_handle_t *zhp, const char *options, int flags)
 	 * Append zfsutil option so the mount helper allow the mount
 	 */
 	strlcat(mntopts, "," MNTOPT_ZFSUTIL, sizeof (mntopts));
-
-	if (!zfs_is_mountable(zhp, mountpoint, sizeof (mountpoint), NULL))
-		return (0);
 
 	/* Create the directory if it doesn't already exist */
 	if (lstat(mountpoint, &buf) != 0) {

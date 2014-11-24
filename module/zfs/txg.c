@@ -21,7 +21,7 @@
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Portions Copyright 2011 Martin Matuska
- * Copyright (c) 2013 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2014 by Delphix. All rights reserved.
  */
 
 #include <sys/zfs_context.h>
@@ -480,7 +480,7 @@ txg_sync_thread(dsl_pool_t *dp)
 	tx_state_t *tx = &dp->dp_tx;
 	callb_cpr_t cpr;
 	vdev_stat_t *vs1, *vs2;
-	uint64_t start, delta;
+	clock_t start, delta;
 
 #ifdef _KERNEL
 	/*
@@ -498,7 +498,7 @@ txg_sync_thread(dsl_pool_t *dp)
 
 	start = delta = 0;
 	for (;;) {
-		uint64_t timer, timeout;
+		clock_t timer, timeout;
 		uint64_t txg;
 		uint64_t ndirty;
 
@@ -539,7 +539,9 @@ txg_sync_thread(dsl_pool_t *dp)
 			txg_thread_exit(tx, &cpr, &tx->tx_sync_thread);
 		}
 
+		spa_config_enter(spa, SCL_ALL, FTAG, RW_READER);
 		vdev_get_stats(spa->spa_root_vdev, vs1);
+		spa_config_exit(spa, SCL_ALL, FTAG);
 
 		/*
 		 * Consume the quiesced txg which has been handed off to
@@ -575,7 +577,9 @@ txg_sync_thread(dsl_pool_t *dp)
 		 */
 		txg_dispatch_callbacks(dp, txg);
 
+		spa_config_enter(spa, SCL_ALL, FTAG, RW_READER);
 		vdev_get_stats(spa->spa_root_vdev, vs2);
+		spa_config_exit(spa, SCL_ALL, FTAG);
 		spa_txg_history_set_io(spa, txg,
 		    vs2->vs_bytes[ZIO_TYPE_READ]-vs1->vs_bytes[ZIO_TYPE_READ],
 		    vs2->vs_bytes[ZIO_TYPE_WRITE]-vs1->vs_bytes[ZIO_TYPE_WRITE],
@@ -780,6 +784,26 @@ boolean_t
 txg_list_empty(txg_list_t *tl, uint64_t txg)
 {
 	return (tl->tl_head[txg & TXG_MASK] == NULL);
+}
+
+/*
+ * Returns true if all txg lists are empty.
+ *
+ * Warning: this is inherently racy (an item could be added immediately
+ * after this function returns). We don't bother with the lock because
+ * it wouldn't change the semantics.
+ */
+boolean_t
+txg_all_lists_empty(txg_list_t *tl)
+{
+	int i;
+
+	for (i = 0; i < TXG_SIZE; i++) {
+		if (!txg_list_empty(tl, i)) {
+			return (B_FALSE);
+		}
+	}
+	return (B_TRUE);
 }
 
 /*

@@ -283,9 +283,10 @@ vdev_config_generate(spa_t *spa, vdev_t *vd, boolean_t getstats,
 			    vd->vdev_removing);
 	}
 
-	if (vd->vdev_dtl_smo.smo_object != 0)
+	if (vd->vdev_dtl_sm != NULL) {
 		fnvlist_add_uint64(nv, ZPOOL_CONFIG_DTL,
-		    vd->vdev_dtl_smo.smo_object);
+		    space_map_object(vd->vdev_dtl_sm));
+	}
 
 	if (vd->vdev_crtxg)
 		fnvlist_add_uint64(nv, ZPOOL_CONFIG_CREATE_TXG, vd->vdev_crtxg);
@@ -598,7 +599,8 @@ vdev_inuse(vdev_t *vd, uint64_t crtxg, vdev_labeltype_t reason,
 	 * read-only.  Instead we look to see if the pools is marked
 	 * read-only in the namespace and set the state to active.
 	 */
-	if ((spa = spa_by_guid(pool_guid, device_guid)) != NULL &&
+	if (state != POOL_STATE_SPARE && state != POOL_STATE_L2CACHE &&
+	    (spa = spa_by_guid(pool_guid, device_guid)) != NULL &&
 	    spa_mode(spa) == FREAD)
 		state = POOL_STATE_ACTIVE;
 

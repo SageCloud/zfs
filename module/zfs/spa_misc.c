@@ -20,7 +20,7 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2013 by Delphix. All rights reserved.
+ * Copyright (c) 2011, 2014 by Delphix. All rights reserved.
  * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
  */
 
@@ -34,6 +34,7 @@
 #include <sys/zap.h>
 #include <sys/zil.h>
 #include <sys/vdev_impl.h>
+#include <sys/vdev_file.h>
 #include <sys/metaslab.h>
 #include <sys/uberblock_impl.h>
 #include <sys/txg.h>
@@ -237,6 +238,53 @@ static avl_tree_t spa_l2cache_avl;
 kmem_cache_t *spa_buffer_pool;
 int spa_mode_global;
 
+#ifdef ZFS_DEBUG
+/* Everything except dprintf and spa is on by default in debug builds */
+int zfs_flags = ~(ZFS_DEBUG_DPRINTF | ZFS_DEBUG_SPA);
+#else
+int zfs_flags = 0;
+#endif
+
+/*
+ * zfs_recover can be set to nonzero to attempt to recover from
+ * otherwise-fatal errors, typically caused by on-disk corruption.  When
+ * set, calls to zfs_panic_recover() will turn into warning messages.
+ * This should only be used as a last resort, as it typically results
+ * in leaked space, or worse.
+ */
+int zfs_recover = B_FALSE;
+
+/*
+ * If destroy encounters an EIO while reading metadata (e.g. indirect
+ * blocks), space referenced by the missing metadata can not be freed.
+ * Normally this causes the background destroy to become "stalled", as
+ * it is unable to make forward progress.  While in this stalled state,
+ * all remaining space to free from the error-encountering filesystem is
+ * "temporarily leaked".  Set this flag to cause it to ignore the EIO,
+ * permanently leak the space from indirect blocks that can not be read,
+ * and continue to free everything else that it can.
+ *
+ * The default, "stalling" behavior is useful if the storage partially
+ * fails (i.e. some but not all i/os fail), and then later recovers.  In
+ * this case, we will be able to continue pool operations while it is
+ * partially failed, and when it recovers, we can continue to free the
+ * space, with no leaks.  However, note that this case is actually
+ * fairly rare.
+ *
+ * Typically pools either (a) fail completely (but perhaps temporarily,
+ * e.g. a top-level vdev going offline), or (b) have localized,
+ * permanent errors (e.g. disk returns the wrong data due to bit flip or
+ * firmware bug).  In case (a), this setting does not matter because the
+ * pool will be suspended and the sync thread will not be able to make
+ * forward progress regardless.  In case (b), because the error is
+ * permanent, the best we can do is leak the minimum amount of space,
+ * which is what setting this flag will do.  Therefore, it is reasonable
+ * for this flag to normally be set, but we chose the more conservative
+ * approach of not setting it, so that there is no possibility of
+ * leaking space in the "partial temporary" failure case.
+ */
+int zfs_free_leak_on_eio = B_FALSE;
+
 /*
  * Expiration time in milliseconds. This value has two meanings. First it is
  * used to determine when the spa_deadman() logic should fire. By default the
@@ -427,7 +475,7 @@ spa_lookup(const char *name)
 	 * If it's a full dataset name, figure out the pool name and
 	 * just use that.
 	 */
-	cp = strpbrk(search.spa_name, "/@");
+	cp = strpbrk(search.spa_name, "/@#");
 	if (cp != NULL)
 		*cp = '\0';
 
@@ -468,6 +516,7 @@ spa_add(const char *name, nvlist_t *config, const char *altroot)
 	spa_t *spa;
 	spa_config_dirent_t *dp;
 	int t;
+	int i;
 
 	ASSERT(MUTEX_HELD(&spa_namespace_lock));
 
@@ -546,6 +595,15 @@ spa_add(const char *name, nvlist_t *config, const char *altroot)
 	}
 
 	spa->spa_debug = ((zfs_flags & ZFS_DEBUG_SPA) != 0);
+
+	/*
+	 * As a pool is being created, treat all features as disabled by
+	 * setting SPA_FEATURE_DISABLED for all entries in the feature
+	 * refcount cache.
+	 */
+	for (i = 0; i < SPA_FEATURES; i++) {
+		spa->spa_feat_refcount_cache[i] = SPA_FEATURE_DISABLED;
+	}
 
 	return (spa);
 }
@@ -985,7 +1043,7 @@ spa_vdev_config_exit(spa_t *spa, vdev_t *vd, uint64_t txg, int error, char *tag)
 		txg_wait_synced(spa->spa_dsl_pool, txg);
 
 	if (vd != NULL) {
-		ASSERT(!vd->vdev_detached || vd->vdev_dtl_smo.smo_object == 0);
+		ASSERT(!vd->vdev_detached || vd->vdev_dtl_sm == NULL);
 		spa_config_enter(spa, SCL_ALL, spa, RW_WRITER);
 		vdev_free(vd);
 		spa_config_exit(spa, SCL_ALL, spa);
@@ -1093,17 +1151,27 @@ spa_vdev_state_exit(spa_t *spa, vdev_t *vd, int error)
  */
 
 void
-spa_activate_mos_feature(spa_t *spa, const char *feature)
+spa_activate_mos_feature(spa_t *spa, const char *feature, dmu_tx_t *tx)
 {
-	(void) nvlist_add_boolean(spa->spa_label_features, feature);
-	vdev_config_dirty(spa->spa_root_vdev);
+	if (!nvlist_exists(spa->spa_label_features, feature)) {
+		fnvlist_add_boolean(spa->spa_label_features, feature);
+		/*
+		 * When we are creating the pool (tx_txg==TXG_INITIAL), we can't
+		 * dirty the vdev config because lock SCL_CONFIG is not held.
+		 * Thankfully, in this case we don't need to dirty the config
+		 * because it will be written out anyway when we finish
+		 * creating the pool.
+		 */
+		if (tx->tx_txg != TXG_INITIAL)
+			vdev_config_dirty(spa->spa_root_vdev);
+	}
 }
 
 void
 spa_deactivate_mos_feature(spa_t *spa, const char *feature)
 {
-	(void) nvlist_remove_all(spa->spa_label_features, feature);
-	vdev_config_dirty(spa->spa_root_vdev);
+	if (nvlist_remove_all(spa->spa_label_features, feature) == 0)
+		vdev_config_dirty(spa->spa_root_vdev);
 }
 
 /*
@@ -1254,7 +1322,7 @@ spa_generate_guid(spa_t *spa)
 }
 
 void
-sprintf_blkptr(char *buf, const blkptr_t *bp)
+snprintf_blkptr(char *buf, size_t buflen, const blkptr_t *bp)
 {
 	char type[256];
 	char *checksum = NULL;
@@ -1272,11 +1340,15 @@ sprintf_blkptr(char *buf, const blkptr_t *bp)
 			(void) strlcpy(type, dmu_ot[BP_GET_TYPE(bp)].ot_name,
 			    sizeof (type));
 		}
-		checksum = zio_checksum_table[BP_GET_CHECKSUM(bp)].ci_name;
+		if (!BP_IS_EMBEDDED(bp)) {
+			checksum =
+			    zio_checksum_table[BP_GET_CHECKSUM(bp)].ci_name;
+		}
 		compress = zio_compress_table[BP_GET_COMPRESS(bp)].ci_name;
 	}
 
-	SPRINTF_BLKPTR(snprintf, ' ', buf, bp, type, checksum, compress);
+	SNPRINTF_BLKPTR(snprintf, ' ', buf, buflen, bp, type, checksum,
+	    compress);
 }
 
 void
@@ -1292,6 +1364,16 @@ spa_freeze(spa_t *spa)
 	spa_config_exit(spa, SCL_ALL, FTAG);
 	if (freeze_txg != 0)
 		txg_wait_synced(spa_get_dsl(spa), freeze_txg);
+}
+
+void
+zfs_panic_recover(const char *fmt, ...)
+{
+	va_list adx;
+
+	va_start(adx, fmt);
+	vcmn_err(zfs_recover ? CE_WARN : CE_PANIC, fmt, adx);
+	va_end(adx);
 }
 
 /*
@@ -1552,7 +1634,9 @@ dva_get_dsize_sync(spa_t *spa, const dva_t *dva)
 
 	if (asize != 0 && spa->spa_deflate) {
 		vdev_t *vd = vdev_lookup_top(spa, DVA_GET_VDEV(dva));
-		dsize = (asize >> SPA_MINBLOCKSHIFT) * vd->vdev_deflate_ratio;
+		if (vd != NULL)
+			dsize = (asize >> SPA_MINBLOCKSHIFT) *
+			    vd->vdev_deflate_ratio;
 	}
 
 	return (dsize);
@@ -1564,7 +1648,7 @@ bp_get_dsize_sync(spa_t *spa, const blkptr_t *bp)
 	uint64_t dsize = 0;
 	int d;
 
-	for (d = 0; d < SPA_DVAS_PER_BP; d++)
+	for (d = 0; d < BP_GET_NDVAS(bp); d++)
 		dsize += dva_get_dsize_sync(spa, &bp->blk_dva[d]);
 
 	return (dsize);
@@ -1578,7 +1662,7 @@ bp_get_dsize(spa_t *spa, const blkptr_t *bp)
 
 	spa_config_enter(spa, SCL_VDEV, FTAG, RW_READER);
 
-	for (d = 0; d < SPA_DVAS_PER_BP; d++)
+	for (d = 0; d < BP_GET_NDVAS(bp); d++)
 		dsize += dva_get_dsize_sync(spa, &bp->blk_dva[d]);
 
 	spa_config_exit(spa, SCL_VDEV, FTAG);
@@ -1652,12 +1736,13 @@ spa_init(int mode)
 	fm_init();
 	refcount_init();
 	unique_init();
-	space_map_init();
+	range_tree_init();
 	ddt_init();
 	zio_init();
 	dmu_init();
 	zil_init();
 	vdev_cache_stat_init();
+	vdev_file_init();
 	zfs_prop_init();
 	zpool_prop_init();
 	zpool_feature_init();
@@ -1672,12 +1757,13 @@ spa_fini(void)
 
 	spa_evict_all();
 
+	vdev_file_fini();
 	vdev_cache_stat_fini();
 	zil_fini();
 	dmu_fini();
 	zio_fini();
 	ddt_fini();
-	space_map_fini();
+	range_tree_fini();
 	unique_fini();
 	refcount_fini();
 	fm_fini();
@@ -1725,6 +1811,16 @@ boolean_t
 spa_writeable(spa_t *spa)
 {
 	return (!!(spa->spa_mode & FWRITE));
+}
+
+/*
+ * Returns true if there is a pending sync task in any of the current
+ * syncing txg, the current quiescing txg, or the current open txg.
+ */
+boolean_t
+spa_has_pending_synctask(spa_t *spa)
+{
+	return (!txg_all_lists_empty(&spa->spa_dsl_pool->dp_sync_tasks));
 }
 
 int
@@ -1868,7 +1964,7 @@ EXPORT_SYMBOL(spa_strdup);
 EXPORT_SYMBOL(spa_strfree);
 EXPORT_SYMBOL(spa_get_random);
 EXPORT_SYMBOL(spa_generate_guid);
-EXPORT_SYMBOL(sprintf_blkptr);
+EXPORT_SYMBOL(snprintf_blkptr);
 EXPORT_SYMBOL(spa_freeze);
 EXPORT_SYMBOL(spa_upgrade);
 EXPORT_SYMBOL(spa_evict_all);
@@ -1883,6 +1979,16 @@ EXPORT_SYMBOL(spa_writeable);
 EXPORT_SYMBOL(spa_mode);
 
 EXPORT_SYMBOL(spa_namespace_lock);
+
+module_param(zfs_flags, int, 0644);
+MODULE_PARM_DESC(zfs_flags, "Set additional debugging flags");
+
+module_param(zfs_recover, int, 0644);
+MODULE_PARM_DESC(zfs_recover, "Set to attempt to recover from fatal errors");
+
+module_param(zfs_free_leak_on_eio, int, 0644);
+MODULE_PARM_DESC(zfs_free_leak_on_eio,
+	"Set to ignore IO errors during free and permanently leak the space");
 
 module_param(zfs_deadman_synctime_ms, ulong, 0644);
 MODULE_PARM_DESC(zfs_deadman_synctime_ms, "Expiration time in milliseconds");

@@ -25,7 +25,7 @@
 /*
  * Copyright 2011 Nexenta Systems, Inc. All rights reserved.
  * Copyright (c) 2012, Joyent, Inc. All rights reserved.
- * Copyright (c) 2013 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2014 by Delphix. All rights reserved.
  */
 
 #ifndef _SYS_ZFS_CONTEXT_H
@@ -66,7 +66,9 @@
 #include <sys/sunddi.h>
 #include <sys/ctype.h>
 #include <sys/disp.h>
+#include <sys/trace.h>
 #include <linux/dcache_compat.h>
+#include <linux/utsname_compat.h>
 
 #else /* _KERNEL */
 
@@ -90,6 +92,7 @@
 #include <string.h>
 #include <strings.h>
 #include <pthread.h>
+#include <synch.h>
 #include <assert.h>
 #include <alloca.h>
 #include <umem.h>
@@ -116,6 +119,7 @@
 #include <sys/fm/fs/zfs.h>
 #include <sys/sunddi.h>
 #include <sys/debug.h>
+#include <sys/utsname.h>
 
 /*
  * Stack
@@ -137,23 +141,21 @@
 #define	CE_PANIC	3	/* panic		*/
 #define	CE_IGNORE	4	/* print nothing	*/
 
-extern int aok;
-
 /*
  * ZFS debugging
  */
 
 extern void dprintf_setup(int *argc, char **argv);
-extern void __dprintf(const char *file, const char *func,
-    int line, const char *fmt, ...);
+
 extern void cmn_err(int, const char *, ...);
-extern void vcmn_err(int, const char *, __va_list);
+extern void vcmn_err(int, const char *, va_list);
 extern void panic(const char *, ...);
-extern void vpanic(const char *, __va_list);
+extern void vpanic(const char *, va_list);
 
 #define	fm_panic	panic
 
-#ifdef __sun
+extern int aok;
+
 /*
  * DTrace SDT probes have different signatures in userland than they do in
  * kernel.  If they're being used in kernel code, re-define them out of
@@ -199,19 +201,17 @@ extern void vpanic(const char *, __va_list);
  * "return (SET_ERROR(log_error(EINVAL, info)));" would log the error twice).
  */
 #define	SET_ERROR(err) (ZFS_SET_ERROR(err), err)
-#else
-#define	SET_ERROR(err) (err)
-#endif
+
 /*
- * Threads
+ * Threads.  TS_STACK_MIN is dictated by the minimum allowed pthread stack
+ * size.  While TS_STACK_MAX is somewhat arbitrary, it was selected to be
+ * large enough for the expected stack depth while small enough to avoid
+ * exhausting address space with high thread counts.
  */
 #define	TS_MAGIC		0x72f158ab4261e538ull
 #define	TS_RUN			0x00000002
-#ifdef __linux__
-#define	STACK_SIZE		8192	/* Linux x86 and amd64 */
-#else
-#define	STACK_SIZE		24576	/* Solaris */
-#endif
+#define	TS_STACK_MIN		PTHREAD_STACK_MIN
+#define	TS_STACK_MAX		(256 * 1024)
 
 /* in libzpool, p0 exists only to have its address taken */
 typedef struct proc {
@@ -584,6 +584,16 @@ extern vnode_t *rootdir;
 #define	ddi_get_lbolt64()	(gethrtime() >> 23)
 #define	hz	119	/* frequency when using gethrtime() >> 23 for lbolt */
 
+#define	ddi_time_before(a, b)		(a < b)
+#define	ddi_time_after(a, b)		ddi_time_before(b, a)
+#define	ddi_time_before_eq(a, b)	(!ddi_time_after(a, b))
+#define	ddi_time_after_eq(a, b)		ddi_time_before_eq(b, a)
+
+#define	ddi_time_before64(a, b)		(a < b)
+#define	ddi_time_after64(a, b)		ddi_time_before64(b, a)
+#define	ddi_time_before_eq64(a, b)	(!ddi_time_after64(a, b))
+#define	ddi_time_after_eq64(a, b)	ddi_time_before_eq64(b, a)
+
 extern void delay(clock_t ticks);
 
 #define	SEC_TO_TICK(sec)	((sec) * hz)
@@ -612,7 +622,7 @@ extern void delay(clock_t ticks);
 
 extern uint64_t physmem;
 
-extern int highbit(ulong_t i);
+extern int highbit64(uint64_t i);
 extern int random_get_bytes(uint8_t *ptr, size_t len);
 extern int random_get_pseudo_bytes(uint8_t *ptr, size_t len);
 
@@ -660,6 +670,9 @@ extern int ddi_strtoul(const char *str, char **nptr, int base,
 
 extern int ddi_strtoull(const char *str, char **nptr, int base,
     u_longlong_t *result);
+
+typedef struct utsname	utsname_t;
+extern utsname_t *utsname(void);
 
 /* ZFS Boot Related stuff. */
 

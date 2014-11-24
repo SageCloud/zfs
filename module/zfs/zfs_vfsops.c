@@ -679,12 +679,7 @@ zfs_sb_create(const char *osname, zfs_sb_t **zsbp)
 	error = zfs_get_zplprop(os, ZFS_PROP_VERSION, &zsb->z_version);
 	if (error) {
 		goto out;
-	} else if (zsb->z_version >
-	    zfs_zpl_version_map(spa_version(dmu_objset_spa(os)))) {
-		(void) printk("Can't mount a version %lld file system "
-		    "on a version %lld pool\n. Pool must be upgraded to mount "
-		    "this file system.", (u_longlong_t)zsb->z_version,
-		    (u_longlong_t)spa_version(dmu_objset_spa(os)));
+	} else if (zsb->z_version > ZPL_VERSION) {
 		error = SET_ERROR(ENOTSUP);
 		goto out;
 	}
@@ -1441,7 +1436,7 @@ zfs_vget(struct super_block *sb, struct inode **ipp, fid_t *fidp)
 
 	gen_mask = -1ULL >> (64 - 8 * i);
 
-	dprintf("getting %llu [%u mask %llx]\n", object, fid_gen, gen_mask);
+	dprintf("getting %llu [%llu mask %llx]\n", object, fid_gen, gen_mask);
 	if ((err = zfs_zget(zsb, object, &zp))) {
 		ZFS_EXIT(zsb);
 		return (err);
@@ -1452,7 +1447,8 @@ zfs_vget(struct super_block *sb, struct inode **ipp, fid_t *fidp)
 	if (zp_gen == 0)
 		zp_gen = 1;
 	if (zp->z_unlinked || zp_gen != fid_gen) {
-		dprintf("znode gen (%u) != fid gen (%u)\n", zp_gen, fid_gen);
+		dprintf("znode gen (%llu) != fid gen (%llu)\n", zp_gen,
+		    fid_gen);
 		iput(ZTOI(zp));
 		ZFS_EXIT(zsb);
 		return (SET_ERROR(EINVAL));

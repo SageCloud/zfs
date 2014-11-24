@@ -24,7 +24,7 @@
  */
 
 /*
- * Copyright (c) 2013 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2014 by Delphix. All rights reserved.
  */
 
 #include <sys/zfs_context.h>
@@ -230,13 +230,22 @@ vdev_queue_class_min_active(zio_priority_t p)
 }
 
 static int
-vdev_queue_max_async_writes(uint64_t dirty)
+vdev_queue_max_async_writes(spa_t *spa)
 {
 	int writes;
+	uint64_t dirty = spa->spa_dsl_pool->dp_dirty_total;
 	uint64_t min_bytes = zfs_dirty_data_max *
 	    zfs_vdev_async_write_active_min_dirty_percent / 100;
 	uint64_t max_bytes = zfs_dirty_data_max *
 	    zfs_vdev_async_write_active_max_dirty_percent / 100;
+
+	/*
+	 * Sync tasks correspond to interactive user actions. To reduce the
+	 * execution time of those actions we push data out as fast as possible.
+	 */
+	if (spa_has_pending_synctask(spa)) {
+		return (zfs_vdev_async_write_max_active);
+	}
 
 	if (dirty < min_bytes)
 		return (zfs_vdev_async_write_min_active);
@@ -270,8 +279,7 @@ vdev_queue_class_max_active(spa_t *spa, zio_priority_t p)
 	case ZIO_PRIORITY_ASYNC_READ:
 		return (zfs_vdev_async_read_max_active);
 	case ZIO_PRIORITY_ASYNC_WRITE:
-		return (vdev_queue_max_async_writes(
-		    spa->spa_dsl_pool->dp_dirty_total));
+		return (vdev_queue_max_async_writes(spa));
 	case ZIO_PRIORITY_SCRUB:
 		return (zfs_vdev_scrub_max_active);
 	default:
@@ -659,7 +667,6 @@ vdev_queue_io_to_issue(vdev_queue_t *vq)
 	zio_priority_t p;
 	avl_index_t idx;
 	vdev_queue_class_t *vqc;
-	zio_t *search;
 
 again:
 	ASSERT(MUTEX_HELD(&vq->vq_lock));
@@ -678,11 +685,10 @@ again:
 	 * For FIFO queues (sync), issue the i/o with the lowest timestamp.
 	 */
 	vqc = &vq->vq_class[p];
-	search = zio_buf_alloc(sizeof (*search));
-	search->io_timestamp = 0;
-	search->io_offset = vq->vq_last_offset + 1;
-	VERIFY3P(avl_find(&vqc->vqc_queued_tree, search, &idx), ==, NULL);
-	zio_buf_free(search, sizeof (*search));
+	vq->vq_io_search.io_timestamp = 0;
+	vq->vq_io_search.io_offset = vq->vq_last_offset + 1;
+	VERIFY3P(avl_find(&vqc->vqc_queued_tree, &vq->vq_io_search,
+	    &idx), ==, NULL);
 	zio = avl_nearest(&vqc->vqc_queued_tree, idx, AVL_AFTER);
 	if (zio == NULL)
 		zio = avl_first(&vqc->vqc_queued_tree);
