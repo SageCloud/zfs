@@ -20,7 +20,7 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012 by Delphix. All rights reserved.
+ * Copyright (c) 2013 by Delphix. All rights reserved.
  */
 
 #ifndef	_SYS_ZAP_H
@@ -129,16 +129,30 @@ typedef enum zap_flags {
  *     MT_FIRST/MT_BEST matching will find entries that match without
  *     regard to case (eg. looking for "foo" can find an entry "Foo").
  * Eventually, other flags will permit unicode normalization as well.
+ *
+ * dnodesize specifies the on-disk size of the dnode for the new zapobj.
+ * Valid values are multiples of 512 up to DNODE_MAX_SIZE.
  */
 uint64_t zap_create(objset_t *ds, dmu_object_type_t ot,
     dmu_object_type_t bonustype, int bonuslen, dmu_tx_t *tx);
+uint64_t zap_create_dnsize(objset_t *ds, dmu_object_type_t ot,
+    dmu_object_type_t bonustype, int bonuslen, int dnodesize, dmu_tx_t *tx);
 uint64_t zap_create_norm(objset_t *ds, int normflags, dmu_object_type_t ot,
     dmu_object_type_t bonustype, int bonuslen, dmu_tx_t *tx);
+uint64_t zap_create_norm_dnsize(objset_t *ds, int normflags,
+    dmu_object_type_t ot, dmu_object_type_t bonustype, int bonuslen,
+    int dnodesize, dmu_tx_t *tx);
 uint64_t zap_create_flags(objset_t *os, int normflags, zap_flags_t flags,
     dmu_object_type_t ot, int leaf_blockshift, int indirect_blockshift,
     dmu_object_type_t bonustype, int bonuslen, dmu_tx_t *tx);
+uint64_t zap_create_flags_dnsize(objset_t *os, int normflags,
+    zap_flags_t flags, dmu_object_type_t ot, int leaf_blockshift,
+    int indirect_blockshift, dmu_object_type_t bonustype, int bonuslen,
+    int dnodesize, dmu_tx_t *tx);
 uint64_t zap_create_link(objset_t *os, dmu_object_type_t ot,
     uint64_t parent_obj, const char *name, dmu_tx_t *tx);
+uint64_t zap_create_link_dnsize(objset_t *os, dmu_object_type_t ot,
+    uint64_t parent_obj, const char *name, int dnodesize, dmu_tx_t *tx);
 
 /*
  * Initialize an already-allocated object.
@@ -152,9 +166,14 @@ void mzap_create_impl(objset_t *os, uint64_t obj, int normflags,
  */
 int zap_create_claim(objset_t *ds, uint64_t obj, dmu_object_type_t ot,
     dmu_object_type_t bonustype, int bonuslen, dmu_tx_t *tx);
+int zap_create_claim_dnsize(objset_t *ds, uint64_t obj, dmu_object_type_t ot,
+    dmu_object_type_t bonustype, int bonuslen, int dnodesize, dmu_tx_t *tx);
 int zap_create_claim_norm(objset_t *ds, uint64_t obj,
     int normflags, dmu_object_type_t ot,
     dmu_object_type_t bonustype, int bonuslen, dmu_tx_t *tx);
+int zap_create_claim_norm_dnsize(objset_t *ds, uint64_t obj,
+    int normflags, dmu_object_type_t ot,
+    dmu_object_type_t bonustype, int bonuslen, int dnodesize, dmu_tx_t *tx);
 
 /*
  * The zapobj passed in must be a valid ZAP object for all of the
@@ -213,10 +232,18 @@ int zap_lookup_norm(objset_t *ds, uint64_t zapobj, const char *name,
 int zap_lookup_uint64(objset_t *os, uint64_t zapobj, const uint64_t *key,
     int key_numints, uint64_t integer_size, uint64_t num_integers, void *buf);
 int zap_contains(objset_t *ds, uint64_t zapobj, const char *name);
+int zap_prefetch(objset_t *os, uint64_t zapobj, const char *name);
 int zap_prefetch_uint64(objset_t *os, uint64_t zapobj, const uint64_t *key,
     int key_numints);
 
-int zap_count_write(objset_t *os, uint64_t zapobj, const char *name,
+int zap_lookup_by_dnode(dnode_t *dn, const char *name,
+    uint64_t integer_size, uint64_t num_integers, void *buf);
+int zap_lookup_norm_by_dnode(dnode_t *dn, const char *name,
+    uint64_t integer_size, uint64_t num_integers, void *buf,
+    matchtype_t mt, char *realname, int rn_len,
+    boolean_t *ncp);
+
+int zap_count_write_by_dnode(dnode_t *dn, const char *name,
     int add, uint64_t *towrite, uint64_t *tooverwrite);
 
 /*
@@ -343,7 +370,7 @@ typedef struct {
 	boolean_t za_normalization_conflict;
 	uint64_t za_num_integers;
 	uint64_t za_first_integer;	/* no sign extension for <8byte ints */
-	char za_name[MAXNAMELEN];
+	char za_name[ZAP_MAXNAMELEN];
 } zap_attribute_t;
 
 /*
@@ -379,11 +406,6 @@ void zap_cursor_advance(zap_cursor_t *zc);
  * fewer than 2^22 (4.2 million) entries in the zap object.
  */
 uint64_t zap_cursor_serialize(zap_cursor_t *zc);
-
-/*
- * Advance the cursor to the attribute having the given key.
- */
-int zap_cursor_move_to_key(zap_cursor_t *zc, const char *name, matchtype_t mt);
 
 /*
  * Initialize a zap cursor pointing to the position recorded by

@@ -20,7 +20,9 @@
  */
 
 /*
+ * Copyright 2015 Nexenta Systems, Inc.  All rights reserved.
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014 by Delphix. All rights reserved.
  */
 
 /*
@@ -228,7 +230,7 @@ static boolean_t
 zfs_is_mountable(zfs_handle_t *zhp, char *buf, size_t buflen,
     zprop_source_t *source)
 {
-	char sourceloc[ZFS_MAXNAMELEN];
+	char sourceloc[MAXNAMELEN];
 	zprop_source_t sourcetype;
 
 	if (!zfs_prop_valid_for_type(ZFS_PROP_MOUNTPOINT, zhp->zfs_type,
@@ -363,6 +365,14 @@ zfs_add_options(zfs_handle_t *zhp, char *options, int len)
 
 	error = zfs_add_option(zhp, options, len,
 	    ZFS_PROP_ATIME, MNTOPT_ATIME, MNTOPT_NOATIME);
+	/*
+	 * don't add relatime/strictatime when atime=off, otherwise strictatime
+	 * will force atime=on
+	 */
+	if (strstr(options, MNTOPT_NOATIME) == NULL) {
+		error = zfs_add_option(zhp, options, len,
+		    ZFS_PROP_RELATIME, MNTOPT_RELATIME, MNTOPT_STRICTATIME);
+	}
 	error = error ? error : zfs_add_option(zhp, options, len,
 	    ZFS_PROP_DEVICES, MNTOPT_DEVICES, MNTOPT_NODEVICES);
 	error = error ? error : zfs_add_option(zhp, options, len,
@@ -371,8 +381,6 @@ zfs_add_options(zfs_handle_t *zhp, char *options, int len)
 	    ZFS_PROP_READONLY, MNTOPT_RO, MNTOPT_RW);
 	error = error ? error : zfs_add_option(zhp, options, len,
 	    ZFS_PROP_SETUID, MNTOPT_SETUID, MNTOPT_NOSETUID);
-	error = error ? error : zfs_add_option(zhp, options, len,
-	    ZFS_PROP_XATTR, MNTOPT_XATTR, MNTOPT_NOXATTR);
 	error = error ? error : zfs_add_option(zhp, options, len,
 	    ZFS_PROP_NBMAND, MNTOPT_NBMAND, MNTOPT_NONBMAND);
 
@@ -388,6 +396,7 @@ zfs_mount(zfs_handle_t *zhp, const char *options, int flags)
 	struct stat buf;
 	char mountpoint[ZFS_MAXPROPLEN];
 	char mntopts[MNT_LINE_MAX];
+	char overlay[ZFS_MAXPROPLEN];
 	libzfs_handle_t *hdl = zhp->zfs_hdl;
 	int remount = 0, rc;
 
@@ -438,6 +447,19 @@ zfs_mount(zfs_handle_t *zhp, const char *options, int flags)
 			return (zfs_error_fmt(hdl, EZFS_MOUNTFAILED,
 			    dgettext(TEXT_DOMAIN, "cannot mount '%s'"),
 			    mountpoint));
+		}
+	}
+
+	/*
+	 * Overlay mounts are disabled by default but may be enabled
+	 * via the 'overlay' property or the 'zfs mount -O' option.
+	 */
+	if (!(flags & MS_OVERLAY)) {
+		if (zfs_prop_get(zhp, ZFS_PROP_OVERLAY, overlay,
+			    sizeof (overlay), NULL, NULL, 0, B_FALSE) == 0) {
+			if (strcmp(overlay, "on") == 0) {
+				flags |= MS_OVERLAY;
+			}
 		}
 	}
 
@@ -732,13 +754,6 @@ zfs_share_proto(zfs_handle_t *zhp, zfs_share_proto_t *proto)
 	if (!zfs_is_mountable(zhp, mountpoint, sizeof (mountpoint), NULL))
 		return (0);
 
-	if ((ret = zfs_init_libshare(hdl, SA_INIT_SHARE_API)) != SA_OK) {
-		(void) zfs_error_fmt(hdl, EZFS_SHARENFSFAILED,
-		    dgettext(TEXT_DOMAIN, "cannot share '%s': %s"),
-		    zfs_get_name(zhp), sa_errorstr(ret));
-		return (-1);
-	}
-
 	for (curr_proto = proto; *curr_proto != PROTO_END; curr_proto++) {
 		/*
 		 * Return success if there are no share options.
@@ -748,6 +763,14 @@ zfs_share_proto(zfs_handle_t *zhp, zfs_share_proto_t *proto)
 		    ZFS_MAXPROPLEN, B_FALSE) != 0 ||
 		    strcmp(shareopts, "off") == 0)
 			continue;
+
+		ret = zfs_init_libshare(hdl, SA_INIT_SHARE_API);
+		if (ret != SA_OK) {
+			(void) zfs_error_fmt(hdl, EZFS_SHARENFSFAILED,
+			    dgettext(TEXT_DOMAIN, "cannot share '%s': %s"),
+			    zfs_get_name(zhp), sa_errorstr(ret));
+			return (-1);
+		}
 
 		/*
 		 * If the 'zoned' property is set, then zfs_is_mountable()
@@ -845,7 +868,7 @@ unshare_one(libzfs_handle_t *hdl, const char *name, const char *mountpoint,
 	/* make sure libshare initialized */
 	if ((err = zfs_init_libshare(hdl, SA_INIT_SHARE_API)) != SA_OK) {
 		free(mntpt);	/* don't need the copy anymore */
-		return (zfs_error_fmt(hdl, EZFS_SHARENFSFAILED,
+		return (zfs_error_fmt(hdl, EZFS_UNSHARENFSFAILED,
 		    dgettext(TEXT_DOMAIN, "cannot unshare '%s': %s"),
 		    name, sa_errorstr(err)));
 	}
@@ -1028,6 +1051,17 @@ mount_cb(zfs_handle_t *zhp, void *data)
 		return (0);
 	}
 
+	/*
+	 * If this filesystem is inconsistent and has a receive resume
+	 * token, we can not mount it.
+	 */
+	if (zfs_prop_get_int(zhp, ZFS_PROP_INCONSISTENT) &&
+	    zfs_prop_get(zhp, ZFS_PROP_RECEIVE_RESUME_TOKEN,
+	    NULL, 0, NULL, NULL, 0, B_TRUE) == 0) {
+		zfs_close(zhp);
+		return (0);
+	}
+
 	libzfs_add_handle(cbp, zhp);
 	if (zfs_iter_filesystems(zhp, mount_cb, cbp) != 0) {
 		zfs_close(zhp);
@@ -1060,7 +1094,7 @@ libzfs_dataset_cmp(const void *a, const void *b)
 	if (gotb)
 		return (1);
 
-	return (strcmp(zfs_get_name(a), zfs_get_name(b)));
+	return (strcmp(zfs_get_name(*za), zfs_get_name(*zb)));
 }
 
 /*

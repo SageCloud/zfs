@@ -21,7 +21,7 @@
 
 /*
  * Copyright (c) 2006, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2013 by Delphix. All rights reserved.
+ * Copyright (c) 2011, 2015 by Delphix. All rights reserved.
  */
 
 #include <sys/spa.h>
@@ -46,7 +46,7 @@
  * The history log is stored as a dmu object containing
  * <packed record length, record nvlist> tuples.
  *
- * Where "record nvlist" is a nvlist containing uint64_ts and strings, and
+ * Where "record nvlist" is an nvlist containing uint64_ts and strings, and
  * "packed record length" is the packed length of the "record nvlist" stored
  * as a little endian uint64_t.
  *
@@ -89,7 +89,7 @@ spa_history_create_obj(spa_t *spa, dmu_tx_t *tx)
 
 	ASSERT(spa->spa_history == 0);
 	spa->spa_history = dmu_object_alloc(mos, DMU_OT_SPA_HISTORY,
-	    SPA_MAXBLOCKSIZE, DMU_OT_SPA_HISTORY_OFFSETS,
+	    SPA_OLD_MAXBLOCKSIZE, DMU_OT_SPA_HISTORY_OFFSETS,
 	    sizeof (spa_history_phys_t), tx);
 
 	VERIFY(zap_add(mos, DMU_POOL_DIRECTORY_OBJECT,
@@ -260,7 +260,7 @@ spa_history_log_sync(void *arg, dmu_tx_t *tx)
 	}
 
 	VERIFY3U(nvlist_pack(nvl, &record_packed, &reclen, NV_ENCODE_NATIVE,
-	    KM_PUSHPAGE), ==, 0);
+	    KM_SLEEP), ==, 0);
 
 	mutex_enter(&spa->spa_history_lock);
 
@@ -289,9 +289,7 @@ int
 spa_history_log(spa_t *spa, const char *msg)
 {
 	int err;
-	nvlist_t *nvl;
-
-	VERIFY0(nvlist_alloc(&nvl, NV_UNIQUE_NAME, KM_PUSHPAGE));
+	nvlist_t *nvl = fnvlist_alloc();
 
 	fnvlist_add_string(nvl, ZPOOL_HIST_CMD, msg);
 	err = spa_history_log_nvl(spa, nvl);
@@ -316,7 +314,7 @@ spa_history_log_nvl(spa_t *spa, nvlist_t *nvl)
 		return (err);
 	}
 
-	VERIFY0(nvlist_dup(nvl, &nvarg, KM_PUSHPAGE));
+	VERIFY0(nvlist_dup(nvl, &nvarg, KM_SLEEP));
 	if (spa_history_zone() != NULL) {
 		fnvlist_add_string(nvarg, ZPOOL_HIST_ZONE,
 		    spa_history_zone());
@@ -325,7 +323,7 @@ spa_history_log_nvl(spa_t *spa, nvlist_t *nvl)
 
 	/* Kick this off asynchronously; errors are ignored. */
 	dsl_sync_task_nowait(spa_get_dsl(spa), spa_history_log_sync,
-	    nvarg, 0, tx);
+	    nvarg, 0, ZFS_SPACE_CHECK_NONE, tx);
 	dmu_tx_commit(tx);
 
 	/* spa_history_log_sync will free nvl */
@@ -438,8 +436,6 @@ log_internal(nvlist_t *nvl, const char *operation, spa_t *spa,
     dmu_tx_t *tx, const char *fmt, va_list adx)
 {
 	char *msg;
-	va_list adx1;
-	int size;
 
 	/*
 	 * If this is part of creating a pool, not everything is
@@ -451,15 +447,9 @@ log_internal(nvlist_t *nvl, const char *operation, spa_t *spa,
 		return;
 	}
 
-	va_copy(adx1, adx);
-	size = vsnprintf(NULL, 0, fmt, adx1) + 1;
-	msg = kmem_alloc(size, KM_PUSHPAGE);
-	va_end(adx1);
-	va_copy(adx1, adx);
-	(void) vsprintf(msg, fmt, adx1);
-	va_end(adx1);
+	msg = kmem_vasprintf(fmt, adx);
 	fnvlist_add_string(nvl, ZPOOL_HIST_INT_STR, msg);
-	kmem_free(msg, size);
+	strfree(msg);
 
 	fnvlist_add_string(nvl, ZPOOL_HIST_INT_NAME, operation);
 	fnvlist_add_uint64(nvl, ZPOOL_HIST_TXG, tx->tx_txg);
@@ -468,7 +458,7 @@ log_internal(nvlist_t *nvl, const char *operation, spa_t *spa,
 		spa_history_log_sync(nvl, tx);
 	} else {
 		dsl_sync_task_nowait(spa_get_dsl(spa),
-		    spa_history_log_sync, nvl, 0, tx);
+		    spa_history_log_sync, nvl, 0, ZFS_SPACE_CHECK_NONE, tx);
 	}
 	/* spa_history_log_sync() will free nvl */
 }
@@ -479,7 +469,6 @@ spa_history_log_internal(spa_t *spa, const char *operation,
 {
 	dmu_tx_t *htx = tx;
 	va_list adx;
-	nvlist_t *nvl;
 
 	/* create a tx if we didn't get one */
 	if (tx == NULL) {
@@ -491,8 +480,7 @@ spa_history_log_internal(spa_t *spa, const char *operation,
 	}
 
 	va_start(adx, fmt);
-	VERIFY0(nvlist_alloc(&nvl, NV_UNIQUE_NAME, KM_PUSHPAGE));
-	log_internal(nvl, operation, spa, htx, fmt, adx);
+	log_internal(fnvlist_alloc(), operation, spa, htx, fmt, adx);
 	va_end(adx);
 
 	/* if we didn't get a tx from the caller, commit the one we made */
@@ -505,13 +493,12 @@ spa_history_log_internal_ds(dsl_dataset_t *ds, const char *operation,
     dmu_tx_t *tx, const char *fmt, ...)
 {
 	va_list adx;
-	char namebuf[MAXNAMELEN];
-	nvlist_t *nvl;
+	char namebuf[ZFS_MAX_DATASET_NAME_LEN];
+	nvlist_t *nvl = fnvlist_alloc();
 
 	ASSERT(tx != NULL);
 
 	dsl_dataset_name(ds, namebuf);
-	VERIFY0(nvlist_alloc(&nvl, NV_UNIQUE_NAME, KM_PUSHPAGE));
 	fnvlist_add_string(nvl, ZPOOL_HIST_DSNAME, namebuf);
 	fnvlist_add_uint64(nvl, ZPOOL_HIST_DSID, ds->ds_object);
 
@@ -525,16 +512,15 @@ spa_history_log_internal_dd(dsl_dir_t *dd, const char *operation,
     dmu_tx_t *tx, const char *fmt, ...)
 {
 	va_list adx;
-	char namebuf[MAXNAMELEN];
-	nvlist_t *nvl;
+	char namebuf[ZFS_MAX_DATASET_NAME_LEN];
+	nvlist_t *nvl = fnvlist_alloc();
 
 	ASSERT(tx != NULL);
 
 	dsl_dir_name(dd, namebuf);
-	VERIFY0(nvlist_alloc(&nvl, NV_UNIQUE_NAME, KM_PUSHPAGE));
 	fnvlist_add_string(nvl, ZPOOL_HIST_DSNAME, namebuf);
 	fnvlist_add_uint64(nvl, ZPOOL_HIST_DSID,
-	    dd->dd_phys->dd_head_dataset_obj);
+	    dsl_dir_phys(dd)->dd_head_dataset_obj);
 
 	va_start(adx, fmt);
 	log_internal(nvl, operation, dd->dd_pool->dp_spa, tx, fmt, adx);

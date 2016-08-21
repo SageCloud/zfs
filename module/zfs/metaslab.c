@@ -20,7 +20,7 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2011, 2014 by Delphix. All rights reserved.
+ * Copyright (c) 2011, 2015 by Delphix. All rights reserved.
  * Copyright (c) 2013 by Saso Kiselkov. All rights reserved.
  */
 
@@ -53,7 +53,14 @@
 #define	METASLAB_ACTIVE_MASK		\
 	(METASLAB_WEIGHT_PRIMARY | METASLAB_WEIGHT_SECONDARY)
 
-uint64_t metaslab_aliquot = 512ULL << 10;
+/*
+ * Metaslab granularity, in bytes. This is roughly similar to what would be
+ * referred to as the "stripe size" in traditional RAID arrays. In normal
+ * operation, we will try to write this amount of data to a top-level vdev
+ * before moving on to the next one.
+ */
+unsigned long metaslab_aliquot = 512 << 10;
+
 uint64_t metaslab_gang_bang = SPA_MAXBLOCKSIZE + 1;	/* force gang blocks */
 
 /*
@@ -138,12 +145,6 @@ uint64_t metaslab_df_alloc_threshold = SPA_MAXBLOCKSIZE;
 int metaslab_df_free_pct = 4;
 
 /*
- * A metaslab is considered "free" if it contains a contiguous
- * segment which is greater than metaslab_min_alloc_size.
- */
-uint64_t metaslab_min_alloc_size = DMU_MAX_ACCESS;
-
-/*
  * Percentage of all cpus that can be used by the metaslab taskq.
  */
 int metaslab_load_pct = 50;
@@ -192,12 +193,11 @@ metaslab_class_create(spa_t *spa, metaslab_ops_t *ops)
 {
 	metaslab_class_t *mc;
 
-	mc = kmem_zalloc(sizeof (metaslab_class_t), KM_PUSHPAGE);
+	mc = kmem_zalloc(sizeof (metaslab_class_t), KM_SLEEP);
 
 	mc->mc_spa = spa;
 	mc->mc_rotor = NULL;
 	mc->mc_ops = ops;
-	mutex_init(&mc->mc_fastwrite_lock, NULL, MUTEX_DEFAULT, NULL);
 
 	return (mc);
 }
@@ -211,7 +211,6 @@ metaslab_class_destroy(metaslab_class_t *mc)
 	ASSERT(mc->mc_space == 0);
 	ASSERT(mc->mc_dspace == 0);
 
-	mutex_destroy(&mc->mc_fastwrite_lock);
 	kmem_free(mc, sizeof (metaslab_class_t));
 }
 
@@ -286,7 +285,7 @@ metaslab_class_histogram_verify(metaslab_class_t *mc)
 		return;
 
 	mc_hist = kmem_zalloc(sizeof (uint64_t) * RANGE_TREE_HISTOGRAM_SIZE,
-	    KM_PUSHPAGE);
+	    KM_SLEEP);
 
 	for (c = 0; c < rvd->vdev_children; c++) {
 		vdev_t *tvd = rvd->vdev_child[c];
@@ -482,7 +481,7 @@ metaslab_group_create(metaslab_class_t *mc, vdev_t *vd)
 {
 	metaslab_group_t *mg;
 
-	mg = kmem_zalloc(sizeof (metaslab_group_t), KM_PUSHPAGE);
+	mg = kmem_zalloc(sizeof (metaslab_group_t), KM_SLEEP);
 	mutex_init(&mg->mg_lock, NULL, MUTEX_DEFAULT, NULL);
 	avl_create(&mg->mg_metaslab_tree, metaslab_compare,
 	    sizeof (metaslab_t), offsetof(struct metaslab, ms_group_node));
@@ -491,7 +490,7 @@ metaslab_group_create(metaslab_class_t *mc, vdev_t *vd)
 	mg->mg_activation_count = 0;
 
 	mg->mg_taskq = taskq_create("metaslab_group_taskq", metaslab_load_pct,
-	    minclsyspri, 10, INT_MAX, TASKQ_THREADS_CPU_PCT);
+	    maxclsyspri, 10, INT_MAX, TASKQ_THREADS_CPU_PCT | TASKQ_DYNAMIC);
 
 	return (mg);
 }
@@ -562,7 +561,7 @@ metaslab_group_passivate(metaslab_group_t *mg)
 		return;
 	}
 
-	taskq_wait(mg->mg_taskq);
+	taskq_wait_outstanding(mg->mg_taskq, 0);
 	metaslab_group_alloc_update(mg);
 
 	mgprev = mg->mg_prev;
@@ -598,7 +597,7 @@ metaslab_group_histogram_verify(metaslab_group_t *mg)
 		return;
 
 	mg_hist = kmem_zalloc(sizeof (uint64_t) * RANGE_TREE_HISTOGRAM_SIZE,
-	    KM_PUSHPAGE);
+	    KM_SLEEP);
 
 	ASSERT3U(RANGE_TREE_HISTOGRAM_SIZE, >=,
 	    SPACE_MAP_HISTOGRAM_SIZE + ashift);
@@ -1246,7 +1245,7 @@ metaslab_init(metaslab_group_t *mg, uint64_t id, uint64_t object, uint64_t txg,
 	metaslab_t *ms;
 	int error;
 
-	ms = kmem_zalloc(sizeof (metaslab_t), KM_PUSHPAGE);
+	ms = kmem_zalloc(sizeof (metaslab_t), KM_SLEEP);
 	mutex_init(&ms->ms_lock, NULL, MUTEX_DEFAULT, NULL);
 	cv_init(&ms->ms_load_cv, NULL, CV_DEFAULT, NULL);
 	ms->ms_id = id;
@@ -1517,7 +1516,7 @@ metaslab_weight(metaslab_t *msp)
 	 * In effect, this means that we'll select the metaslab with the most
 	 * free bandwidth rather than simply the one with the most free space.
 	 */
-	if (metaslab_lba_weighting_enabled) {
+	if (!vd->vdev_nonrot && metaslab_lba_weighting_enabled) {
 		weight = 2 * weight - (msp->ms_id * weight) / vd->vdev_ms_count;
 		ASSERT(weight >= space && weight <= 2 * space);
 	}
@@ -1578,6 +1577,7 @@ metaslab_preload(void *arg)
 {
 	metaslab_t *msp = arg;
 	spa_t *spa = msp->ms_group->mg_vd->vdev_spa;
+	fstrans_cookie_t cookie = spl_fstrans_mark();
 
 	ASSERT(!MUTEX_HELD(&msp->ms_group->mg_lock));
 
@@ -1591,6 +1591,7 @@ metaslab_preload(void *arg)
 	 */
 	msp->ms_access_txg = spa_syncing_txg(spa) + metaslab_unload_delay + 1;
 	mutex_exit(&msp->ms_lock);
+	spl_fstrans_unmark(cookie);
 }
 
 static void
@@ -1602,7 +1603,7 @@ metaslab_group_preload(metaslab_group_t *mg)
 	int m = 0;
 
 	if (spa_shutting_down(spa) || !metaslab_preload_enabled) {
-		taskq_wait(mg->mg_taskq);
+		taskq_wait_outstanding(mg->mg_taskq, 0);
 		return;
 	}
 
@@ -1639,7 +1640,7 @@ metaslab_group_preload(metaslab_group_t *mg)
 		 */
 		mutex_exit(&mg->mg_lock);
 		VERIFY(taskq_dispatch(mg->mg_taskq, metaslab_preload,
-		    msp, TQ_PUSHPAGE) != 0);
+		    msp, TQ_SLEEP) != 0);
 		mutex_enter(&mg->mg_lock);
 		msp = msp_next;
 	}
@@ -1739,10 +1740,11 @@ metaslab_condense(metaslab_t *msp, uint64_t txg, dmu_tx_t *tx)
 	ASSERT(msp->ms_loaded);
 
 
-	spa_dbgmsg(spa, "condensing: txg %llu, msp[%llu] %p, "
-	    "smp size %llu, segments %lu, forcing condense=%s", txg,
-	    msp->ms_id, msp, space_map_length(msp->ms_sm),
-	    avl_numnodes(&msp->ms_tree->rt_root),
+	spa_dbgmsg(spa, "condensing: txg %llu, msp[%llu] %p, vdev id %llu, "
+	    "spa %s, smp size %llu, segments %lu, forcing condense=%s", txg,
+	    msp->ms_id, msp, msp->ms_group->mg_vd->vdev_id,
+	    msp->ms_group->mg_vd->vdev_spa->spa_name,
+	    space_map_length(msp->ms_sm), avl_numnodes(&msp->ms_tree->rt_root),
 	    msp->ms_condense_wanted ? "TRUE" : "FALSE");
 
 	msp->ms_condense_wanted = B_FALSE;
@@ -2210,9 +2212,6 @@ metaslab_alloc_dva(spa_t *spa, metaslab_class_t *mc, uint64_t psize,
 	if (psize >= metaslab_gang_bang && (ddi_get_lbolt() & 3) == 0)
 		return (SET_ERROR(ENOSPC));
 
-	if (flags & METASLAB_FASTWRITE)
-		mutex_enter(&mc->mc_fastwrite_lock);
-
 	/*
 	 * Start at the rotor and loop through all mgs until we find something.
 	 * Note that there's no locking on mc_rotor or mc_aliquot because
@@ -2341,28 +2340,42 @@ top:
 			 * figure out whether the corresponding vdev is
 			 * over- or under-used relative to the pool,
 			 * and set an allocation bias to even it out.
+			 *
+			 * Bias is also used to compensate for unequally
+			 * sized vdevs so that space is allocated fairly.
 			 */
 			if (mc->mc_aliquot == 0 && metaslab_bias_enabled) {
 				vdev_stat_t *vs = &vd->vdev_stat;
-				int64_t vu, cu;
-
-				vu = (vs->vs_alloc * 100) / (vs->vs_space + 1);
-				cu = (mc->mc_alloc * 100) / (mc->mc_space + 1);
+				int64_t vs_free = vs->vs_space - vs->vs_alloc;
+				int64_t mc_free = mc->mc_space - mc->mc_alloc;
+				int64_t ratio;
 
 				/*
 				 * Calculate how much more or less we should
 				 * try to allocate from this device during
 				 * this iteration around the rotor.
-				 * For example, if a device is 80% full
-				 * and the pool is 20% full then we should
-				 * reduce allocations by 60% on this device.
 				 *
-				 * mg_bias = (20 - 80) * 512K / 100 = -307K
+				 * This basically introduces a zero-centered
+				 * bias towards the devices with the most
+				 * free space, while compensating for vdev
+				 * size differences.
 				 *
-				 * This reduces allocations by 307K for this
-				 * iteration.
+				 * Examples:
+				 *  vdev V1 = 16M/128M
+				 *  vdev V2 = 16M/128M
+				 *  ratio(V1) = 100% ratio(V2) = 100%
+				 *
+				 *  vdev V1 = 16M/128M
+				 *  vdev V2 = 64M/128M
+				 *  ratio(V1) = 127% ratio(V2) =  72%
+				 *
+				 *  vdev V1 = 16M/128M
+				 *  vdev V2 = 64M/512M
+				 *  ratio(V1) =  40% ratio(V2) = 160%
 				 */
-				mg->mg_bias = ((cu - vu) *
+				ratio = (vs_free * mc->mc_alloc_groups * 100) /
+				    (mc_free + 1);
+				mg->mg_bias = ((ratio - 100) *
 				    (int64_t)mg->mg_aliquot) / 100;
 			} else if (!metaslab_bias_enabled) {
 				mg->mg_bias = 0;
@@ -2377,13 +2390,13 @@ top:
 
 			DVA_SET_VDEV(&dva[d], vd->vdev_id);
 			DVA_SET_OFFSET(&dva[d], offset);
-			DVA_SET_GANG(&dva[d], !!(flags & METASLAB_GANG_HEADER));
+			DVA_SET_GANG(&dva[d],
+			    ((flags & METASLAB_GANG_HEADER) ? 1 : 0));
 			DVA_SET_ASIZE(&dva[d], asize);
 
 			if (flags & METASLAB_FASTWRITE) {
 				atomic_add_64(&vd->vdev_pending_fastwrite,
 				    psize);
-				mutex_exit(&mc->mc_fastwrite_lock);
 			}
 
 			return (0);
@@ -2407,9 +2420,6 @@ next:
 
 	bzero(&dva[d], sizeof (dva_t));
 
-	if (flags & METASLAB_FASTWRITE)
-		mutex_exit(&mc->mc_fastwrite_lock);
-
 	return (SET_ERROR(ENOSPC));
 }
 
@@ -2426,16 +2436,14 @@ metaslab_free_dva(spa_t *spa, const dva_t *dva, uint64_t txg, boolean_t now)
 	vdev_t *vd;
 	metaslab_t *msp;
 
-	ASSERT(DVA_IS_VALID(dva));
-
 	if (txg > spa_freeze_txg(spa))
 		return;
 
-	if ((vd = vdev_lookup_top(spa, vdev)) == NULL ||
+	if ((vd = vdev_lookup_top(spa, vdev)) == NULL || !DVA_IS_VALID(dva) ||
 	    (offset >> vd->vdev_ms_shift) >= vd->vdev_ms_count) {
-		cmn_err(CE_WARN, "metaslab_free_dva(): bad DVA %llu:%llu",
-		    (u_longlong_t)vdev, (u_longlong_t)offset);
-		ASSERT(0);
+		zfs_panic_recover("metaslab_free_dva(): bad DVA %llu:%llu:%llu",
+		    (u_longlong_t)vdev, (u_longlong_t)offset,
+		    (u_longlong_t)size);
 		return;
 	}
 
@@ -2564,7 +2572,7 @@ metaslab_alloc(spa_t *spa, metaslab_class_t *mc, uint64_t psize, blkptr_t *bp,
 
 	spa_config_exit(spa, SCL_ALLOC, FTAG);
 
-	BP_SET_BIRTH(bp, txg, txg);
+	BP_SET_BIRTH(bp, txg, 0);
 
 	return (0);
 }
@@ -2694,6 +2702,7 @@ metaslab_check_free(spa_t *spa, const blkptr_t *bp)
 }
 
 #if defined(_KERNEL) && defined(HAVE_SPL)
+module_param(metaslab_aliquot, ulong, 0644);
 module_param(metaslab_debug_load, int, 0644);
 module_param(metaslab_debug_unload, int, 0644);
 module_param(metaslab_preload_enabled, int, 0644);
@@ -2704,6 +2713,8 @@ module_param(metaslab_fragmentation_factor_enabled, int, 0644);
 module_param(metaslab_lba_weighting_enabled, int, 0644);
 module_param(metaslab_bias_enabled, int, 0644);
 
+MODULE_PARM_DESC(metaslab_aliquot,
+	"allocation granularity (a.k.a. stripe size)");
 MODULE_PARM_DESC(metaslab_debug_load,
 	"load all metaslabs when pool is first opened");
 MODULE_PARM_DESC(metaslab_debug_unload,

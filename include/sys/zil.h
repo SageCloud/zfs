@@ -37,6 +37,9 @@
 extern "C" {
 #endif
 
+struct dsl_pool;
+struct dsl_dataset;
+
 /*
  * Intent log format:
  *
@@ -90,7 +93,6 @@ typedef struct zil_chain {
 } zil_chain_t;
 
 #define	ZIL_MIN_BLKSZ	4096ULL
-#define	ZIL_MAX_BLKSZ	SPA_MAXBLOCKSIZE
 
 /*
  * The words of a log block checksum.
@@ -169,6 +171,19 @@ typedef enum zil_create {
 	(txtype) == TX_ACL_V0 ||	\
 	(txtype) == TX_ACL ||		\
 	(txtype) == TX_WRITE2)
+
+/*
+ * The number of dnode slots consumed by the object is stored in the 8
+ * unused upper bits of the object ID. We subtract 1 from the value
+ * stored on disk for compatibility with implementations that don't
+ * support large dnodes. The slot count for a single-slot dnode will
+ * contain 0 for those bits to preserve the log record format for
+ * "small" dnodes.
+ */
+#define	LR_FOID_GET_SLOTS(oid) (BF64_GET((oid), 56, 8) + 1)
+#define	LR_FOID_SET_SLOTS(oid, x) BF64_SET((oid), 56, 8, (x) - 1)
+#define	LR_FOID_GET_OBJ(oid) BF64_GET((oid), 0, DN_MAX_OBJECT_SHIFT)
+#define	LR_FOID_SET_OBJ(oid, x) BF64_SET((oid), 0, DN_MAX_OBJECT_SHIFT, (x))
 
 /*
  * Format of log records.
@@ -346,7 +361,7 @@ typedef struct {
  *	- the write occupies only one block
  * WR_COPIED:
  *    If we know we'll immediately be committing the
- *    transaction (FSYNC or FDSYNC), the we allocate a larger
+ *    transaction (FSYNC or FDSYNC), then we allocate a larger
  *    log record here for the data and copy the data in.
  * WR_NEED_COPY:
  *    Otherwise we don't allocate a buffer, and *if* we need to
@@ -467,8 +482,10 @@ extern void	zil_itx_assign(zilog_t *zilog, itx_t *itx, dmu_tx_t *tx);
 extern void	zil_commit(zilog_t *zilog, uint64_t oid);
 
 extern int	zil_vdev_offline(const char *osname, void *txarg);
-extern int	zil_claim(const char *osname, void *txarg);
-extern int	zil_check_log_chain(const char *osname, void *txarg);
+extern int	zil_claim(struct dsl_pool *dp,
+    struct dsl_dataset *ds, void *txarg);
+extern int 	zil_check_log_chain(struct dsl_pool *dp,
+    struct dsl_dataset *ds, void *tx);
 extern void	zil_sync(zilog_t *zilog, dmu_tx_t *tx);
 extern void	zil_clean(zilog_t *zilog, uint64_t synced_txg);
 

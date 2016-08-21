@@ -29,14 +29,16 @@
  *
  *  You should have received a copy of the GNU General Public License along
  *  with ZPIOS.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *  Copyright (c) 2015, Intel Corporation.
  */
 
 #include <sys/zfs_context.h>
 #include <sys/dmu.h>
+#include <sys/spa.h>
 #include <sys/txg.h>
 #include <sys/dsl_destroy.h>
 #include <linux/miscdevice.h>
-#include <linux/module_compat.h>
 #include "zpios-internal.h"
 
 
@@ -130,7 +132,16 @@ zpios_dmu_object_create(run_args_t *run_args, objset_t *os)
 {
 	struct dmu_tx *tx;
 	uint64_t obj = 0ULL;
+	uint64_t blksize = run_args->block_size;
 	int rc;
+
+	if (blksize < SPA_MINBLOCKSIZE ||
+	    blksize > spa_maxblocksize(dmu_objset_spa(os)) ||
+	    !ISP2(blksize)) {
+		zpios_print(run_args->file,
+		    "invalid block size for pool: %d\n", (int)blksize);
+		return (obj);
+	}
 
 	tx = dmu_tx_create(os);
 	dmu_tx_hold_write(tx, DMU_NEW_OBJECT, 0, OBJ_SIZE);
@@ -143,10 +154,11 @@ zpios_dmu_object_create(run_args_t *run_args, objset_t *os)
 	}
 
 	obj = dmu_object_alloc(os, DMU_OT_UINT64_OTHER, 0, DMU_OT_NONE, 0, tx);
-	rc = dmu_object_set_blocksize(os, obj, 128ULL << 10, 0, tx);
+	rc = dmu_object_set_blocksize(os, obj, blksize, 0, tx);
 	if (rc) {
 		zpios_print(run_args->file,
-			    "dmu_object_set_blocksize() failed: %d\n", rc);
+		    "dmu_object_set_blocksize to %d failed: %d\n",
+		    (int)blksize, rc);
 		dmu_tx_abort(tx);
 		return (obj);
 	}
@@ -296,6 +308,7 @@ zpios_setup_run(run_args_t **run_args, zpios_cmd_t *kcmd, struct file *file)
 	ra->chunk_noise		= kcmd->cmd_chunk_noise;
 	ra->thread_delay	= kcmd->cmd_thread_delay;
 	ra->flags		= kcmd->cmd_flags;
+	ra->block_size		= kcmd->cmd_block_size;
 	ra->stats.wr_data	= 0;
 	ra->stats.wr_chunks	= 0;
 	ra->stats.rd_data	= 0;
@@ -1292,7 +1305,7 @@ static struct miscdevice zpios_misc = {
 #define	ZFS_DEBUG_STR   ""
 #endif
 
-static int
+static int __init
 zpios_init(void)
 {
 	int error;
@@ -1308,23 +1321,17 @@ zpios_init(void)
 	return (error);
 }
 
-static int
+static void __exit
 zpios_fini(void)
 {
-	int error;
-
-	error = misc_deregister(&zpios_misc);
-	if (error)
-		printk(KERN_INFO "ZPIOS: misc_deregister() failed %d\n", error);
+	misc_deregister(&zpios_misc);
 
 	printk(KERN_INFO "ZPIOS: Unloaded module v%s-%s%s\n",
 	    ZFS_META_VERSION, ZFS_META_RELEASE, ZFS_DEBUG_STR);
-
-	return (0);
 }
 
-spl_module_init(zpios_init);
-spl_module_exit(zpios_fini);
+module_init(zpios_init);
+module_exit(zpios_fini);
 
 MODULE_AUTHOR("LLNL / Sun");
 MODULE_DESCRIPTION("Kernel PIOS implementation");

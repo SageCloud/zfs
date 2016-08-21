@@ -35,6 +35,7 @@
 
 #include "zfs_prop.h"
 #include "zfs_deleg.h"
+#include "zfs_fletcher.h"
 
 #if defined(_KERNEL)
 #include <sys/systm.h>
@@ -210,6 +211,17 @@ zfs_prop_init(void)
 		{ NULL }
 	};
 
+	static zprop_index_t dnsize_table[] = {
+		{ "legacy",	ZFS_DNSIZE_LEGACY },
+		{ "auto",	ZFS_DNSIZE_AUTO },
+		{ "1k",		ZFS_DNSIZE_1K },
+		{ "2k",		ZFS_DNSIZE_2K },
+		{ "4k",		ZFS_DNSIZE_4K },
+		{ "8k",		ZFS_DNSIZE_8K },
+		{ "16k",	ZFS_DNSIZE_16K },
+		{ NULL }
+	};
+
 	static zprop_index_t redundant_metadata_table[] = {
 		{ "all",	ZFS_REDUNDANT_METADATA_ALL },
 		{ "most",	ZFS_REDUNDANT_METADATA_MOST },
@@ -270,6 +282,9 @@ zfs_prop_init(void)
 	zprop_register_index(ZFS_PROP_XATTR, "xattr", ZFS_XATTR_DIR,
 	    PROP_INHERIT, ZFS_TYPE_FILESYSTEM | ZFS_TYPE_SNAPSHOT,
 	    "on | off | dir | sa", "XATTR", xattr_table);
+	zprop_register_index(ZFS_PROP_DNODESIZE, "dnodesize",
+	    ZFS_DNSIZE_LEGACY, PROP_INHERIT, ZFS_TYPE_FILESYSTEM,
+	    "legacy | auto | 1k | 2k | 4k | 8k | 16k", "DNSIZE", dnsize_table);
 
 	/* inherit index (boolean) properties */
 	zprop_register_index(ZFS_PROP_ATIME, "atime", 1, PROP_INHERIT,
@@ -360,6 +375,10 @@ zfs_prop_init(void)
 	zprop_register_string(ZFS_PROP_SELINUX_ROOTCONTEXT, "rootcontext",
 	    "none", PROP_DEFAULT, ZFS_TYPE_DATASET, "<selinux rootcontext>",
 	    "ROOTCONTEXT");
+	zprop_register_string(ZFS_PROP_RECEIVE_RESUME_TOKEN,
+	    "receive_resume_token",
+	    NULL, PROP_READONLY, ZFS_TYPE_FILESYSTEM | ZFS_TYPE_VOLUME,
+	    "<string token>", "RESUMETOK");
 
 	/* readonly number properties */
 	zprop_register_number(ZFS_PROP_USED, "used", 0, PROP_READONLY,
@@ -411,11 +430,23 @@ zfs_prop_init(void)
 	zprop_register_number(ZFS_PROP_REFRESERVATION, "refreservation", 0,
 	    PROP_DEFAULT, ZFS_TYPE_FILESYSTEM | ZFS_TYPE_VOLUME,
 	    "<size> | none", "REFRESERV");
+	zprop_register_number(ZFS_PROP_FILESYSTEM_LIMIT, "filesystem_limit",
+	    UINT64_MAX, PROP_DEFAULT, ZFS_TYPE_FILESYSTEM,
+	    "<count> | none", "FSLIMIT");
+	zprop_register_number(ZFS_PROP_SNAPSHOT_LIMIT, "snapshot_limit",
+	    UINT64_MAX, PROP_DEFAULT, ZFS_TYPE_FILESYSTEM | ZFS_TYPE_VOLUME,
+	    "<count> | none", "SSLIMIT");
+	zprop_register_number(ZFS_PROP_FILESYSTEM_COUNT, "filesystem_count",
+	    UINT64_MAX, PROP_DEFAULT, ZFS_TYPE_FILESYSTEM,
+	    "<count>", "FSCOUNT");
+	zprop_register_number(ZFS_PROP_SNAPSHOT_COUNT, "snapshot_count",
+	    UINT64_MAX, PROP_DEFAULT, ZFS_TYPE_FILESYSTEM | ZFS_TYPE_VOLUME,
+	    "<count>", "SSCOUNT");
 
 	/* inherit number properties */
 	zprop_register_number(ZFS_PROP_RECORDSIZE, "recordsize",
-	    SPA_MAXBLOCKSIZE, PROP_INHERIT,
-	    ZFS_TYPE_FILESYSTEM, "512 to 128k, power of 2", "RECSIZE");
+	    SPA_OLD_MAXBLOCKSIZE, PROP_INHERIT,
+	    ZFS_TYPE_FILESYSTEM, "512 to 1M, power of 2", "RECSIZE");
 
 	/* hidden properties */
 	zprop_register_hidden(ZFS_PROP_CREATETXG, "createtxg", PROP_TYPE_NUMBER,
@@ -440,6 +471,8 @@ zfs_prop_init(void)
 	    PROP_READONLY, ZFS_TYPE_DATASET, "OBJSETID");
 	zprop_register_hidden(ZFS_PROP_INCONSISTENT, "inconsistent",
 	    PROP_TYPE_NUMBER, PROP_READONLY, ZFS_TYPE_DATASET, "INCONSISTENT");
+	zprop_register_hidden(ZFS_PROP_PREV_SNAP, "prevsnap", PROP_TYPE_STRING,
+	    PROP_READONLY, ZFS_TYPE_FILESYSTEM | ZFS_TYPE_VOLUME, "PREVSNAP");
 
 	/*
 	 * Property to be removed once libbe is integrated
@@ -678,13 +711,21 @@ zfs_prop_align_right(zfs_prop_t prop)
 #endif
 
 #if defined(_KERNEL) && defined(HAVE_SPL)
-#include <linux/module_compat.h>
+static int __init
+zcommon_init(void)
+{
+	fletcher_4_init();
+	return (0);
+}
 
-static int zcommon_init(void) { return 0; }
-static int zcommon_fini(void) { return 0; }
+static void __exit
+zcommon_fini(void)
+{
+	fletcher_4_fini();
+}
 
-spl_module_init(zcommon_init);
-spl_module_exit(zcommon_fini);
+module_init(zcommon_init);
+module_exit(zcommon_fini);
 
 MODULE_DESCRIPTION("Generic ZFS support");
 MODULE_AUTHOR(ZFS_META_AUTHOR);

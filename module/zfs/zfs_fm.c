@@ -321,9 +321,9 @@ zfs_ereport_start(nvlist_t **ereport_out, nvlist_t **detector_out,
 
 		spare_count = spa->spa_spares.sav_count;
 		spare_paths = kmem_zalloc(sizeof (char *) * spare_count,
-		    KM_PUSHPAGE);
+		    KM_SLEEP);
 		spare_guids = kmem_zalloc(sizeof (uint64_t) * spare_count,
-		    KM_PUSHPAGE);
+		    KM_SLEEP);
 
 		for (i = 0; i < spare_count; i++) {
 			spare_vd = spa->spa_spares.sav_vdevs[i];
@@ -457,7 +457,8 @@ update_histogram(uint64_t value_arg, uint16_t *hist, uint32_t *count)
 	/* We store the bits in big-endian (largest-first) order */
 	for (i = 0; i < 64; i++) {
 		if (value & (1ull << i)) {
-			hist[63 - i]++;
+			if (hist[63 - i] < UINT16_MAX)
+				hist[63 - i]++;
 			++bits;
 		}
 	}
@@ -583,7 +584,7 @@ annotate_ecksum(nvlist_t *ereport, zio_bad_cksum_t *info,
 	size_t offset = 0;
 	ssize_t start = -1;
 
-	zfs_ecksum_info_t *eip = kmem_zalloc(sizeof (*eip), KM_PUSHPAGE);
+	zfs_ecksum_info_t *eip = kmem_zalloc(sizeof (*eip), KM_SLEEP);
 
 	/* don't do any annotation for injected checksum errors */
 	if (info != NULL && info->zbc_injected)
@@ -615,7 +616,6 @@ annotate_ecksum(nvlist_t *ereport, zio_bad_cksum_t *info,
 	if (badbuf == NULL || goodbuf == NULL)
 		return (eip);
 
-	ASSERT3U(nui64s, <=, UINT16_MAX);
 	ASSERT3U(size, ==, nui64s * sizeof (uint64_t));
 	ASSERT3U(size, <=, SPA_MAXBLOCKSIZE);
 	ASSERT3U(size, <=, UINT32_MAX);
@@ -752,7 +752,7 @@ zfs_ereport_start_checksum(spa_t *spa, vdev_t *vd,
     struct zio *zio, uint64_t offset, uint64_t length, void *arg,
     zio_bad_cksum_t *info)
 {
-	zio_cksum_report_t *report = kmem_zalloc(sizeof (*report), KM_PUSHPAGE);
+	zio_cksum_report_t *report = kmem_zalloc(sizeof (*report), KM_SLEEP);
 
 	if (zio->io_vsd != NULL)
 		zio->io_vsd_ops->vsd_cksum_report(zio, report, arg);
@@ -761,7 +761,7 @@ zfs_ereport_start_checksum(spa_t *spa, vdev_t *vd,
 
 	/* copy the checksum failure information if it was provided */
 	if (info != NULL) {
-		report->zcr_ckinfo = kmem_zalloc(sizeof (*info), KM_PUSHPAGE);
+		report->zcr_ckinfo = kmem_zalloc(sizeof (*info), KM_SLEEP);
 		bcopy(info, report->zcr_ckinfo, sizeof (*info));
 	}
 
@@ -860,7 +860,7 @@ zfs_ereport_post_checksum(spa_t *spa, vdev_t *vd,
 }
 
 static void
-zfs_post_common(spa_t *spa, vdev_t *vd, const char *name)
+zfs_post_common(spa_t *spa, vdev_t *vd, const char *type, const char *name)
 {
 #ifdef _KERNEL
 	nvlist_t *resource;
@@ -872,7 +872,7 @@ zfs_post_common(spa_t *spa, vdev_t *vd, const char *name)
 	if ((resource = fm_nvlist_create(NULL)) == NULL)
 		return;
 
-	(void) snprintf(class, sizeof (class), "%s.%s.%s", FM_RSRC_RESOURCE,
+	(void) snprintf(class, sizeof (class), "%s.%s.%s", type,
 	    ZFS_ERROR_CLASS, name);
 	VERIFY0(nvlist_add_uint8(resource, FM_VERSION, FM_RSRC_VERSION));
 	VERIFY0(nvlist_add_string(resource, FM_CLASS, class));
@@ -886,6 +886,15 @@ zfs_post_common(spa_t *spa, vdev_t *vd, const char *name)
 		    FM_EREPORT_PAYLOAD_ZFS_VDEV_GUID, vd->vdev_guid));
 		VERIFY0(nvlist_add_uint64(resource,
 		    FM_EREPORT_PAYLOAD_ZFS_VDEV_STATE, vd->vdev_state));
+		if (vd->vdev_path != NULL)
+			VERIFY0(nvlist_add_string(resource,
+			    FM_EREPORT_PAYLOAD_ZFS_VDEV_PATH, vd->vdev_path));
+		if (vd->vdev_devid != NULL)
+			VERIFY0(nvlist_add_string(resource,
+			    FM_EREPORT_PAYLOAD_ZFS_VDEV_DEVID, vd->vdev_devid));
+		if (vd->vdev_fru != NULL)
+			VERIFY0(nvlist_add_string(resource,
+			    FM_EREPORT_PAYLOAD_ZFS_VDEV_FRU, vd->vdev_fru));
 	}
 
 	zfs_zevent_post(resource, NULL, zfs_zevent_post_cb);
@@ -901,7 +910,7 @@ zfs_post_common(spa_t *spa, vdev_t *vd, const char *name)
 void
 zfs_post_remove(spa_t *spa, vdev_t *vd)
 {
-	zfs_post_common(spa, vd, FM_EREPORT_RESOURCE_REMOVED);
+	zfs_post_common(spa, vd, FM_RSRC_CLASS, FM_RESOURCE_REMOVED);
 }
 
 /*
@@ -912,7 +921,7 @@ zfs_post_remove(spa_t *spa, vdev_t *vd)
 void
 zfs_post_autoreplace(spa_t *spa, vdev_t *vd)
 {
-	zfs_post_common(spa, vd, FM_EREPORT_RESOURCE_AUTOREPLACE);
+	zfs_post_common(spa, vd, FM_RSRC_CLASS, FM_RESOURCE_AUTOREPLACE);
 }
 
 /*
@@ -924,7 +933,19 @@ zfs_post_autoreplace(spa_t *spa, vdev_t *vd)
 void
 zfs_post_state_change(spa_t *spa, vdev_t *vd)
 {
-	zfs_post_common(spa, vd, FM_EREPORT_RESOURCE_STATECHANGE);
+	zfs_post_common(spa, vd, FM_RSRC_CLASS, FM_RESOURCE_STATECHANGE);
+}
+
+/*
+ * The 'sysevent.fs.zfs.*' events are signals posted to notify user space of
+ * change in the pool.  All sysevents are listed in sys/sysevent/eventdefs.h
+ * and are designed to be consumed by the ZFS Event Daemon (ZED).  For
+ * additional details refer to the zed(8) man page.
+ */
+void
+zfs_post_sysevent(spa_t *spa, vdev_t *vd, const char *name)
+{
+	zfs_post_common(spa, vd, FM_SYSEVENT_CLASS, name);
 }
 
 #if defined(_KERNEL) && defined(HAVE_SPL)
@@ -933,4 +954,5 @@ EXPORT_SYMBOL(zfs_ereport_post_checksum);
 EXPORT_SYMBOL(zfs_post_remove);
 EXPORT_SYMBOL(zfs_post_autoreplace);
 EXPORT_SYMBOL(zfs_post_state_change);
+EXPORT_SYMBOL(zfs_post_sysevent);
 #endif /* _KERNEL */

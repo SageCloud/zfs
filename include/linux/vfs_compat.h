@@ -21,12 +21,15 @@
 
 /*
  * Copyright (C) 2011 Lawrence Livermore National Security, LLC.
+ * Copyright (C) 2015 Jörg Thalheim.
  */
 
 #ifndef _ZFS_VFS_H
 #define	_ZFS_VFS_H
 
 #include <sys/taskq.h>
+#include <sys/cred.h>
+#include <linux/backing-dev.h>
 
 /*
  * 2.6.28 API change,
@@ -64,25 +67,35 @@ truncate_setsize(struct inode *ip, loff_t new)
 }
 #endif /* HAVE_TRUNCATE_SETSIZE */
 
-#if defined(HAVE_BDI) && !defined(HAVE_BDI_SETUP_AND_REGISTER)
 /*
- * 2.6.34 API change,
- * Add bdi_setup_and_register() function if not yet provided by kernel.
- * It is used to quickly initialize and register a BDI for the filesystem.
+ * 2.6.32 - 2.6.33, bdi_setup_and_register() is not available.
+ * 2.6.34 - 3.19, bdi_setup_and_register() takes 3 arguments.
+ * 4.0 - x.y, bdi_setup_and_register() takes 2 arguments.
  */
+#if defined(HAVE_2ARGS_BDI_SETUP_AND_REGISTER)
+static inline int
+zpl_bdi_setup_and_register(struct backing_dev_info *bdi, char *name)
+{
+	return (bdi_setup_and_register(bdi, name));
+}
+#elif defined(HAVE_3ARGS_BDI_SETUP_AND_REGISTER)
+static inline int
+zpl_bdi_setup_and_register(struct backing_dev_info *bdi, char *name)
+{
+	return (bdi_setup_and_register(bdi, name, BDI_CAP_MAP_COPY));
+}
+#else
 extern atomic_long_t zfs_bdi_seq;
 
 static inline int
-bdi_setup_and_register(
-	struct backing_dev_info *bdi,
-	char *name,
-	unsigned int cap)
+zpl_bdi_setup_and_register(struct backing_dev_info *bdi, char *name)
 {
 	char tmp[32];
 	int error;
 
 	bdi->name = name;
-	bdi->capabilities = cap;
+	bdi->capabilities = BDI_CAP_MAP_COPY;
+
 	error = bdi_init(bdi);
 	if (error)
 		return (error);
@@ -97,7 +110,7 @@ bdi_setup_and_register(
 
 	return (error);
 }
-#endif /* HAVE_BDI && !HAVE_BDI_SETUP_AND_REGISTER */
+#endif
 
 /*
  * 2.6.38 API change,
@@ -190,9 +203,6 @@ lseek_execute(
  * At 60 seconds the kernel will also begin issuing RCU stall warnings.
  */
 #include <linux/posix_acl.h>
-#ifndef HAVE_POSIX_ACL_CACHING
-#define	ACL_NOT_CACHED ((void *)(-1))
-#endif /* HAVE_POSIX_ACL_CACHING */
 
 #if defined(HAVE_POSIX_ACL_RELEASE) && !defined(HAVE_POSIX_ACL_RELEASE_GPL_ONLY)
 
@@ -221,7 +231,6 @@ zpl_posix_acl_release(struct posix_acl *acl)
 
 static inline void
 zpl_set_cached_acl(struct inode *ip, int type, struct posix_acl *newer) {
-#ifdef HAVE_POSIX_ACL_CACHING
 	struct posix_acl *older = NULL;
 
 	spin_lock(&ip->i_lock);
@@ -243,7 +252,6 @@ zpl_set_cached_acl(struct inode *ip, int type, struct posix_acl *newer) {
 	spin_unlock(&ip->i_lock);
 
 	zpl_posix_acl_release(older);
-#endif /* HAVE_POSIX_ACL_CACHING */
 }
 
 static inline void
@@ -308,15 +316,19 @@ typedef umode_t zpl_equivmode_t;
 #else
 typedef mode_t zpl_equivmode_t;
 #endif /* HAVE_POSIX_ACL_EQUIV_MODE_UMODE_T */
-#endif /* CONFIG_FS_POSIX_ACL */
 
-#ifndef HAVE_CURRENT_UMASK
-static inline int
-current_umask(void)
-{
-	return (current->fs->umask);
-}
-#endif /* HAVE_CURRENT_UMASK */
+/*
+ * 4.8 API change,
+ * posix_acl_valid() now must be passed a namespace, the namespace from
+ * from super block associated with the given inode is used for this purpose.
+ */
+#ifdef HAVE_POSIX_ACL_VALID_WITH_NS
+#define	zpl_posix_acl_valid(ip, acl)  posix_acl_valid(ip->i_sb->s_user_ns, acl)
+#else
+#define	zpl_posix_acl_valid(ip, acl)  posix_acl_valid(acl)
+#endif
+
+#endif /* CONFIG_FS_POSIX_ACL */
 
 /*
  * 2.6.38 API change,
@@ -327,5 +339,109 @@ current_umask(void)
 #else
 #define	zpl_inode_owner_or_capable(ip)		is_owner_or_cap(ip)
 #endif /* HAVE_INODE_OWNER_OR_CAPABLE */
+
+/*
+ * 3.19 API change
+ * struct access f->f_dentry->d_inode was replaced by accessor function
+ * file_inode(f)
+ */
+#ifndef HAVE_FILE_INODE
+static inline struct inode *file_inode(const struct file *f)
+{
+	return (f->f_dentry->d_inode);
+}
+#endif /* HAVE_FILE_INODE */
+
+/*
+ * 4.1 API change
+ * struct access file->f_path.dentry was replaced by accessor function
+ * file_dentry(f)
+ */
+#ifndef HAVE_FILE_DENTRY
+static inline struct dentry *file_dentry(const struct file *f)
+{
+	return (f->f_path.dentry);
+}
+#endif /* HAVE_FILE_DENTRY */
+
+#ifdef HAVE_KUID_HELPERS
+static inline uid_t zfs_uid_read_impl(struct inode *ip)
+{
+#ifdef HAVE_SUPER_USER_NS
+	return (from_kuid(ip->i_sb->s_user_ns, ip->i_uid));
+#else
+	return (from_kuid(kcred->user_ns, ip->i_uid));
+#endif
+}
+
+static inline uid_t zfs_uid_read(struct inode *ip)
+{
+	return (zfs_uid_read_impl(ip));
+}
+
+static inline gid_t zfs_gid_read_impl(struct inode *ip)
+{
+#ifdef HAVE_SUPER_USER_NS
+	return (from_kgid(ip->i_sb->s_user_ns, ip->i_gid));
+#else
+	return (from_kgid(kcred->user_ns, ip->i_gid));
+#endif
+}
+
+static inline gid_t zfs_gid_read(struct inode *ip)
+{
+	return (zfs_gid_read_impl(ip));
+}
+
+static inline void zfs_uid_write(struct inode *ip, uid_t uid)
+{
+#ifdef HAVE_SUPER_USER_NS
+	ip->i_uid = make_kuid(ip->i_sb->s_user_ns, uid);
+#else
+	ip->i_uid = make_kuid(kcred->user_ns, uid);
+#endif
+}
+
+static inline void zfs_gid_write(struct inode *ip, gid_t gid)
+{
+#ifdef HAVE_SUPER_USER_NS
+	ip->i_gid = make_kgid(ip->i_sb->s_user_ns, gid);
+#else
+	ip->i_gid = make_kgid(kcred->user_ns, gid);
+#endif
+}
+
+#else
+static inline uid_t zfs_uid_read(struct inode *ip)
+{
+	return (ip->i_uid);
+}
+
+static inline gid_t zfs_gid_read(struct inode *ip)
+{
+	return (ip->i_gid);
+}
+
+static inline void zfs_uid_write(struct inode *ip, uid_t uid)
+{
+	ip->i_uid = uid;
+}
+
+static inline void zfs_gid_write(struct inode *ip, gid_t gid)
+{
+	ip->i_gid = gid;
+}
+#endif
+
+/*
+ * 2.6.38 API change
+ */
+#ifdef HAVE_FOLLOW_DOWN_ONE
+#define	zpl_follow_down_one(path)		follow_down_one(path)
+#define	zpl_follow_up(path)			follow_up(path)
+#else
+#define	zpl_follow_down_one(path)		follow_down(path)
+#define	zpl_follow_up(path)			follow_up(path)
+#endif
 
 #endif /* _ZFS_VFS_H */
